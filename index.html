@@ -367,6 +367,36 @@ function clip(s, max){
   return cut.trim().replace(/[,;:\-]$/,"")+"...";
 }
 
+// 行感知截断：保留多行结构(每行完整)，总长不超 max；含 keep 的行必留，超预算时丢弃靠后的非关键行
+function clipLines(s, max, keep){
+  // 行感知截断：永不丢整行，逐行内部缩短以保住完整模板结构(Hook/Scene/Subject/Lighting...)
+  s=(s||"").trim(); keep=(keep||"").trim();
+  if(s.length<=max) return s;
+  let lines=s.split("\n");
+  const nl=lines.length-1; // 换行符占用
+  // 含 keep 的行(用户备注)与最短的几行视为不可压缩,优先保住
+  const protect=(ln)=> keep && ln.includes(keep);
+  const total=()=> lines.reduce((a,l)=>a+l.length,0)+nl;
+  let guard=0;
+  while(total()>max && guard++<400){
+    // 找当前最长的“可压缩”行来削减
+    let bi=-1, bl=-1;
+    for(let i=0;i<lines.length;i++){
+      if(protect(lines[i])) continue;
+      if(lines[i].length>bl){ bl=lines[i].length; bi=i; }
+    }
+    if(bi<0) break; // 全是受保护行,无法再缩
+    const over=total()-max;
+    const cut=Math.min(over, Math.max(8, Math.floor(bl*0.25)));
+    let target=Math.max(12, bl-cut);
+    lines[bi]=clip(lines[bi], target);
+    if(lines[bi].length>=bl) lines[bi]=lines[bi].slice(0, target); // 兜底硬切,防死循环
+  }
+  let r=lines.join("\n");
+  if(r.length>max) r=clipKeep(r,max,keep); // 极端兜底
+  return r;
+}
+
 // 受保护截断：保证 keep 片段（用户备注）一定保留在结果中
 function clipKeep(s, max, keep){
   s=(s||"").trim();
@@ -519,12 +549,19 @@ function buildScenes(prod, style, len, audience, usp){
 function buildScript(prod, idx){
   const style = state.style || pick(["ugc","energetic","premium","asmr"], idx);
   // 所有用户输入先翻译成英文，确保脚本无中文
-  const audience = toEnglish(document.getElementById('audience').value.trim());
-  const usp = toEnglish(document.getElementById('usp').value.trim());
-  const notes = toEnglish(document.getElementById('notes').value.trim());
+  // 用户填写的三个字段(目标人群/卖点钩子/额外备注)不翻译，原样保留(中文保持中文，英文保持英文)
+  // 只做净化(去 emoji/全角符号)，避免出现"大学生→大students"这种半翻译
+  const audience = asciiClean(document.getElementById('audience').value.trim());
+  const usp = asciiClean(document.getElementById('usp').value.trim());
+  const notes = asciiClean(document.getElementById('notes').value.trim());
   const len=state.len, ratio=state.ratio;
+  // 字幕/口播专用的"纯英文产品名"：删除中文后若为空则回退为 "product"，确保渲染到字幕/口播的内容绝无中文
+  const prodSafe = (function(){
+    const en = asciiClean(prod).replace(/[一-鿿]/g,"").replace(/\s{2,}/g," ").trim();
+    return en.length>=2 ? en : "product";
+  })();
   const scenes=buildScenes(prod, style, len, audience, usp);
-  const hook=asciiClean(HOOKS[idx%HOOKS.length](prod));
+  const hook=asciiClean(HOOKS[idx%HOOKS.length](prodSafe));
   const cta=asciiClean(CTAS[idx%CTAS.length]);
   const styleDesc=STYLE_DESC[style];
 
@@ -568,20 +605,21 @@ function buildScript(prod, idx){
   // 用户备注作为受保护片段，放在结构化模板靠前位置，确保一定出现
   const notesLine = notes? `\nCreative notes (must follow): ${notes}.` : "";
   const structured =
-`Hook: ${hook} Open with a striking 1-2s visual that puts the ${prod} front and center.
+`Hook (spoken line, English only): ${hook} Open with a striking 1-2s visual that puts the ${prodSafe} front and center.
 Scene setup: Minimalist ${prod} showcase styled for TikTok-style product videos, ${moodMap[style]} visual tone; creator's hands optional.
 Subject and product focus: Position the ${prod} as the central focal point. Highlight ${uspPhrase} without overhyped or exaggerated claims.${audPhrase}${notesLine}
+(Non-English wording here describes scene content only - never render it as captions/subtitles or speak it; all captions and voiceover stay English-only.)
 Lighting: ${lightMap[style]}
 Camera movement: ${camMap[style]}
 Shot transition: ${transMap[style]}
 Audio / Voiceover: Natural, unforced English voiceover with tight, snappy pacing, delivered in an authentic creator tone. Voiceover and audio MUST be in English only.
 On-screen text (English only): "${cta}"`;
 
-  // Voiceover / captions
+  // Voiceover / captions —— 会被即梦直接渲染成口播/字幕，必须全英文，绝不拼接中文(usp/notes)
   const vo = [
-    `[0s] HOOK: "${hook}"`,
-    `[mid] VALUE: "Here's why people love this ${prod}${usp? ' - '+usp : ''}."`,
-    `[end] CTA: "${cta}"`
+    `[0s] HOOK (spoken in English): "${hook}"`,
+    `[mid] VALUE (spoken in English): "Here's why people love this ${prodSafe}."`,
+    `[end] CTA (spoken in English): "${cta}"`
   ].join("\n");
 
   // Full production prompt（参考模板的成片 prompt）
@@ -590,7 +628,7 @@ On-screen text (English only): "${cta}"`;
   // 固定头部：UGC 风格 + 语言锁，永远完整保留（不参与截断）
   const lockPrefix = `STYLE: authentic real-user UGC sharing style - shot like a genuine everyday customer casually sharing on their phone, natural and relatable, not like a polished commercial. LANGUAGE LOCK: every on-screen text, caption, subtitle and all voiceover/narration MUST be in English only - never output Chinese or any non-English text on screen or in audio. `;
   const promptBody =
-`Produce a ${len} vertical ${ratio} TikTok-style product video for "${prod}".${noteStr} The video should feel ${moodMap[style]} and be optimized for short-form social product showcases. Open with a striking visual hook that clearly features the product within the first ${sc1} seconds, then progress through concise sequences: an eye-catching opening clip (0-${sc1}s), a close-up detail shot of the product (${sc1}-${sc2}s), and a final hero feature shot (${sc2}-${total}s). Visual style: ${styleDesc}.${audPhrase} Emphasize ${uspPhrase}. ${lightMap[style]} ${camMap[style]} ${transMap[style]} Maintain clean framing, realistic product rendering, and pacing tailored for short-form social media. Pair with an unforced, natural English voiceover in a genuine creator rhythm. Any non-English words above are only scene-content descriptions, not text to display. Add brief English on-screen text only when it enhances viewer comprehension.`;
+`Produce a ${len} vertical ${ratio} TikTok-style product video for "${prodSafe}"${prodSafe!==prod? ` (the product shown is: ${prod})` : ""}.${noteStr} The video should feel ${moodMap[style]} and be optimized for short-form social product showcases. Open with a striking visual hook that clearly features the product within the first ${sc1} seconds, then progress through concise sequences: an eye-catching opening clip (0-${sc1}s), a close-up detail shot of the product (${sc1}-${sc2}s), and a final hero feature shot (${sc2}-${total}s). Visual style: ${styleDesc}.${audPhrase} Emphasize ${uspPhrase}. ${lightMap[style]} ${camMap[style]} ${transMap[style]} Maintain clean framing, realistic product rendering, and pacing tailored for short-form social media. Pair with an unforced, natural English voiceover in a genuine creator rhythm. Any non-English words above describe scene content only and must never appear as on-screen text, captions or spoken words. Add brief English on-screen text only when it enhances viewer comprehension.`;
 
   // Negative constraints（精简版，参考模板）
   // 强制：所有字幕/画面文字/口播/配音必须为英文，禁止生成中文或任何非英文文字
@@ -599,7 +637,7 @@ On-screen text (English only): "${cta}"`;
   // 全部字段统一净化 + 截断，确保无中文且单条脚本不超过 2000 字符
   // 用户备注（notes）作为受保护片段，截断时优先保留
   const keepNote = asciiClean(notes);
-  const out_struct = clipKeep(asciiClean(structured), 820, keepNote);
+  const out_struct = clipLines(asciiClean(structured), 950, keepNote);
   const out_shots  = clip(asciiClean(shots), 430);
   const out_vo     = clip(asciiClean(vo), 200);
   // 固定前缀(UGC风格+语言锁)永远完整保留；只截 body，再拼回前缀
@@ -671,7 +709,7 @@ ${s.negatives}`;
     }
     if(copyText.length>2000){
       const over=copyText.length-2000;
-      sc.structured=clipKeep(sc.structured, Math.max(200, sc.structured.length-over-3), sc.keepNote);
+      sc.structured=clipLines(sc.structured, Math.max(200, sc.structured.length-over-3), sc.keepNote);
       copyText=compose(sc);
     }
     box.innerHTML=`
